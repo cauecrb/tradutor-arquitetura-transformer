@@ -135,7 +135,7 @@ print(dataset)
 #embedding
 class PositionalEncoding(layers.Layer):
     def __init__(self):
-        super(PositionalEncoding, self).__init__
+        super(PositionalEncoding, self).__init__()
         
     def get_angles(selfself, pos, i, d_model):
         angles = 1 / np.power(10000.,(2*(i // 2)) / np.float32(d_model))
@@ -145,7 +145,7 @@ class PositionalEncoding(layers.Layer):
         seq_length = inputs.shape.as_list()[-2]
         d_model = inputs.shape.as_list()[-1]
         angles = self.get_angles(np.arange(seq_length)[:, np.newaxis],
-                                 np.arange(d_model[np.newaxis, :], d_model))
+                                 np.arange(d_model)[np.newaxis, :], d_model)
         angles[:, 0::2] = np.sin(angles[:, 0::2])
         angles[:, 1::2] = np.cos(angles[:, 1::2])
         pos_encoding = angles[np.newaxis, ...]
@@ -226,7 +226,7 @@ class EncoderLayer(layers.Layer):
         self.norm_1 = layers.LayerNormalization(epsilon=1e-6)
 
         self.dense_1 = layers.Dense(units=self.FFN_units, activation='relu')
-        self.dense_2 = layers.Dense(units=self.FFN_units, activation='relu')
+        self.dense_2 = layers.Dense(units=self.d_model, activation='relu')
         self.dropout_2 = layers.Dropout(rate=self.dropout_rate)
 
         self.norm_2 = layers.LayerNormalization(epsilon=1e-6)
@@ -297,7 +297,7 @@ class DecoderLayer(layers.Layer):
         self.norm_2 = layers.LayerNormalization(epsilon=1e-6)
 
         self.dense_1 = layers.Dense(units=self.FFN_units, activation='relu')
-        self.dense_2 = layers.Dense(units=self.FFN_units, activation='relu')
+        self.dense_2 = layers.Dense(units=self.d_model, activation='relu')
         self.dropout_3 = layers.Dropout(rate=self.dropout_rate)
         self.norm_3 = layers.LayerNormalization(epsilon=1e-6)
 
@@ -382,3 +382,144 @@ class Transformer(tf.keras.Model):
         return look_ahead_mask
 
     def call(self, enc_inputs, dec_inputs, training):
+        enc_mask = self.create_padding_mask(enc_inputs)
+        dec_mask_1 = tf.maximum(self.create_padding_mask(dec_inputs), self.create_look_ahead_mask(dec_inputs))
+        dec_mask_2 = self.create_padding_mask(enc_inputs)
+
+        enc_outputs = self.encoder(enc_inputs, enc_mask, training)
+        dec_outputs = self.decoder(dec_inputs, enc_outputs, dec_mask_1, dec_mask_2, training)
+
+        outputs = self.last_linear(dec_outputs)
+
+        return outputs
+
+print("criada ultima junção do transformer")
+
+'''
+criando modulo de treinamento
+'''
+tf.keras.backend.clear_session()
+
+d_model = 512 #128
+nb_layers = 6 #4
+ffn_units = 2048 #512
+nb_proj = 8
+dropout_rate = 0.1
+
+transformer = Transformer(vocab_size_enc=vocab_size_en,
+                          vocab_size_dec=vocab_size_pt,
+                          d_model=d_model,
+                          nb_layers=nb_layers,
+                          FFN_units = ffn_units,
+                          nb_proj=nb_proj,
+                          dropout_rate=dropout_rate)
+
+
+print("parametros configurados e definição")
+
+loss_object = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction='none')
+def loss_function(target, pred):
+    mask = tf.math.logical_not(tf.math.equal(target, 0))
+    loss_ = loss_object(target, pred)
+
+    mask = tf.cast(mask, dtype=loss_.dtype)
+    loss_ *= mask
+    return tf.reduce_mean(loss_)
+
+print('criada função que calcula o erro')
+
+train_loss = tf.keras.metrics.Mean(name='train_loss')
+train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name='train_accuracy')
+
+class CustomSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
+    def __init__(self, d_model, warmup_steps=4000):
+        super(CustomSchedule, self).__init__()
+
+        self.d_model = tf.cast(d_model, tf.float32)
+        self.warmup_steps = warmup_steps
+
+    def __call__(self, step):
+        arg1 = tf.math.rsqrt(step)
+        arg2 = step * (self.warmup_steps ** -1.5)
+
+        return tf.math.rsqrt(self.d_model) * tf.math.minimum(arg1, arg2)
+
+learning_rate = CustomSchedule(d_model)
+
+optimizer = tf.keras.optimizers.Adam(learning_rate, beta_1=0.9, beta_2=0.98, epsilon=1e-9)
+
+print("criado função loss, learning rate e otimizador")
+
+#criando arquivo de chekpoint para o treinamento
+checkpoint_path='/chekpoint'
+ckpt = tf.train.Checkpoint(transformer=transformer,
+                           optimizer=optimizer)
+ckpt_manager = tf.train.CheckpointManager(ckpt, checkpoint_path, max_to_keep=1)
+if ckpt_manager.latest_checkpoint:
+    ckpt.restore(ckpt_manager.latest_checkpoint)
+    print('último checkpoint restaurado')
+
+epochs = 10
+for epoch in range(epochs):
+    print('Start or epoch {}'.format(epoch + 1))
+    start = time.time()
+
+    train_loss.reset_states()
+    train_accuracy.reset_states()
+
+    for (batch, (enc_inputs, targets)) in enumerate(dataset):
+        dec_inputs = targets[:, :-1]
+        dec_outputs_real = targets[:, 1:]
+        with tf.GradientTape() as tape:
+            predictions = transformer(enc_inputs, dec_inputs, True)
+            loss = loss_function(dec_outputs_real, predictions)
+
+        gradients = tape.gradient(loss, transformer.trainable_variables)
+        optimizer.apply_gradients(zip(gradients, transformer.trainable_variables))
+
+        train_loss(loss)
+        train_accuracy(dec_outputs_real, predictions)
+
+        if batch % 50 == 0:
+            print('Epoch {} Batch {} Loss {:.4f} Accuracy {:.4f}'.format(epoch + 1, batch, train_loss.result(),
+                                                                         train_accuracy.result()))
+
+    ckpt_save_path = ckpt_manager.save()
+    print('Saving checkpoint for epoch {} at {}'.format(epoch + 1, ckpt_save_path))
+    print('Time taken for 1 epoch {} secs\n'.format(time.time() - start))
+
+text = 'my name is Cauê'
+text = [vocab_size_en - 2] + tokenizer_en.encode(text) + [vocab_size_en - 1]
+print(text)
+
+text = tf.expand_dims(text, axis=0)
+print(text.shape)
+
+def evaluate(inp_sentence):
+    inp_sentence = [vocab_size_en - 2] + tokenizer_en.encode(inp_sentence) + [vocab_size_en - 1]
+    enc_input = tf.expand_dims(inp_sentence, axis=0)
+
+    output = tf.expand_dims([vocab_size_pt - 2], axis=0)
+
+    for _ in range(max_length):
+        predictions = transformer(enc_input, output, False)
+        prediction = predictions[:, -1:, :]
+
+        prediction_id = tf.cast(tf.argmax(prediction, axis=-1), tf.int32)
+
+        if prediction_id == vocab_size_pt -1:
+            return tf.squeeze(output, axis=0)
+
+        outputs = tf.concat([output, prediction_id], axis=1)
+
+    return tf.squeeze(output, axis = 0)
+
+def translate(sentence):
+    output = evaluate(sentence).numpy()
+
+    predicted_sentence = tokenizer_pt.decode([i for i in output if i < vocab_size_pt -2])
+
+    print('Input: {}'.format(sentence))
+    print('Predicted translation: {}'.format(predicted_sentence))
+
+translate("this is a really powerful tool")
